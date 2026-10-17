@@ -39,42 +39,63 @@ jobs:
           path: upstream
           persist-credentials: false
 
-      - name: Check whether commit image already exists
+      - name: Check whether commit image has both platforms
         id: existing
         shell: bash
         env:
           SHA: ${{ steps.upstream.outputs.sha }}
         run: |
           set -euo pipefail
-          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+          response="$(curl --silent --show-error --write-out $'\n%{http_code}' \
             "https://hub.docker.com/v2/repositories/festum/bansos/tags/sha-${SHA}")"
+          status="${response##*$'\n'}"
+          body="${response%$'\n'*}"
           case "$status" in
-            200|404) printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT" ;;
+            200|404) ;;
             *) echo "Unexpected Docker Hub tag lookup HTTP status: $status" >&2; exit 1 ;;
           esac
-          if [[ "$status" == 200 ]]; then
-            echo "Image for upstream commit ${SHA} is already published; skipping build and push."
+          if [[ "$status" == 404 ]]; then
+            state=rebuild
           else
-            echo "Image for upstream commit ${SHA} is not yet published."
+            if ! jq -e 'type == "object" and (.images | type == "array" and length > 0 and all(.[]; type == "object" and (.os | type == "string") and (.architecture | type == "string")))' <<< "$body" >/dev/null; then
+              echo "Docker Hub tag response has invalid or missing image platform data" >&2
+              exit 1
+            fi
+            if jq -e '([.images[] | select(.os == "linux" and .architecture == "amd64")] | length > 0) and ([.images[] | select(.os == "linux" and .architecture == "arm64")] | length > 0)' <<< "$body" >/dev/null; then
+              state=complete
+            else
+              state=rebuild
+            fi
+          fi
+          printf 'state=%s\n' "$state" >> "$GITHUB_OUTPUT"
+          if [[ "$state" == complete ]]; then
+            echo "Image for upstream commit ${SHA} already includes linux/amd64 and linux/arm64; skipping build and push."
+          else
+            echo "Image for upstream commit ${SHA} needs a multi-platform build."
           fi
 
+      - name: Set up QEMU
+        if: steps.existing.outputs.state != 'complete'
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
-        if: steps.existing.outputs.status == '404'
+        if: steps.existing.outputs.state != 'complete'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: steps.existing.outputs.status == '404'
+        if: steps.existing.outputs.state != 'complete'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push image
-        if: steps.existing.outputs.status == '404'
+        if: steps.existing.outputs.state != 'complete'
         uses: docker/build-push-action@v6
         with:
           context: ./upstream
           file: ./upstream/Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             festum/bansos:latest
